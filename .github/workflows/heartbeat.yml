@@ -1,0 +1,73 @@
+name: Heartbeat (keep scheduled Actions enabled)
+run-name: Heartbeat (${{ github.ref_name }})
+
+# This workflow exists only to solve a GitHub platform limitation: on public
+# repos, GitHub automatically disables `schedule`-triggered workflows after
+# 60 days with no repository push activity, and can also flip a workflow
+# back to disabled shortly after a manual re-enable if the underlying
+# activity gap hasn't been resolved. "4. Build Loop"'s own weekly sync only
+# produces a push when the upstream LoopKit/LoopWorkspace repo has new
+# commits, so a quiet upstream period can leave this fork's schedules
+# silently disabled with no notice.
+#
+# This file is fork-local: it is not present upstream, so future syncs from
+# LoopKit/LoopWorkspace merge in cleanly around it with no conflicts and no
+# maintenance required. It never touches upstream, and it never commits to
+# main/dev (so it never affects the build-tracking git revision) — its own
+# commits go only to a dedicated `heartbeat` branch in this fork.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, well inside GitHub's 60-day inactivity window, and frequent
+    # enough to self-heal quickly if a workflow gets disabled for any reason.
+    - cron: "17 9 * * 3"
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+
+      # Real push activity resets GitHub's 60-day inactivity clock for the
+      # whole repository (all workflows), not just this one.
+      - name: Push a heartbeat commit to a dedicated branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin heartbeat || true
+          if git show-ref --verify --quiet refs/remotes/origin/heartbeat; then
+            git checkout heartbeat
+          else
+            git checkout --orphan heartbeat
+            git rm -rf . > /dev/null
+          fi
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .heartbeat
+          git add .heartbeat
+          git commit -m "chore: heartbeat $(date -u +%Y-%m-%d)" --allow-empty
+          git push origin heartbeat
+
+      # Belt-and-suspenders: directly check whether the workflows this fork
+      # depends on have been disabled (for any reason) and re-enable them,
+      # rather than only relying on activity to prevent it in the first place.
+      - name: Re-enable any disabled scheduled workflows
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          for wf in build_loop.yml heartbeat.yml; do
+            state=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf" --jq .state 2>/dev/null || echo "unknown")
+            echo "$wf state: $state"
+            if [ "$state" != "active" ] && [ "$state" != "unknown" ]; then
+              echo "Re-enabling $wf (was: $state)"
+              gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$wf/enable"
+            fi
+          done
