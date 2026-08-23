@@ -1,14 +1,22 @@
 name: Heartbeat (keep scheduled Actions enabled)
 run-name: Heartbeat (${{ github.ref_name }})
 
-# This workflow exists only to solve a GitHub platform limitation: on public
-# repos, GitHub automatically disables `schedule`-triggered workflows after
-# 60 days with no repository push activity, and can also flip a workflow
-# back to disabled shortly after a manual re-enable if the underlying
-# activity gap hasn't been resolved. "4. Build Loop"'s own weekly sync only
-# produces a push when the upstream LoopKit/LoopWorkspace repo has new
-# commits, so a quiet upstream period can leave this fork's schedules
-# silently disabled with no notice.
+# This workflow exists to solve two overlapping problems with GitHub
+# scheduled workflows on this fork:
+#
+# 1. GitHub automatically disables `schedule`-triggered workflows on public
+#    repos after 60 days with no repository push activity. "4. Build Loop"'s
+#    own weekly sync only produces a push when upstream LoopKit/LoopWorkspace
+#    has new commits, so a quiet upstream period can leave this fork's
+#    schedule silently disabled with no notice.
+# 2. Separately, build_loop.yml has been observed flipping back to disabled
+#    within roughly 10-20 minutes of being re-enabled -- including via a
+#    scripted API call with no human involved -- which doesn't match the
+#    60-day policy at all and looks like a GitHub-side quirk/bug. There's no
+#    way to fully prevent this from inside the repo, so this workflow also
+#    re-enables build_loop.yml a few minutes before its real weekly trigger
+#    time, so it only has to stay enabled for minutes, not a full week, to
+#    make that run.
 #
 # This file is fork-local: it is not present upstream, so future syncs from
 # LoopKit/LoopWorkspace merge in cleanly around it with no conflicts and no
@@ -22,6 +30,15 @@ on:
     # Weekly, well inside GitHub's 60-day inactivity window, and frequent
     # enough to self-heal quickly if a workflow gets disabled for any reason.
     - cron: "17 9 * * 3"
+    # Pre-flight: fires 5 minutes before build_loop.yml's own "33 7 * * 0"
+    # schedule. In practice this fork has seen build_loop.yml flip back to
+    # disabled within ~10-20 minutes of being re-enabled, for reasons that
+    # don't match GitHub's documented 60-day inactivity policy (it has
+    # recurred even immediately after a scripted API re-enable with no
+    # human involved). Re-enabling it right before its real trigger time
+    # means it only needs to survive a few minutes, not a full week, to
+    # make that Sunday run.
+    - cron: "28 7 * * 0"
 
 jobs:
   heartbeat:
