@@ -4,27 +4,30 @@ run-name: Heartbeat (${{ github.ref_name }})
 # This workflow exists because "4. Build Loop" (build_loop.yml) has been
 # found disabled with no Loop build having actually run, and a previous
 # version of this workflow (which only re-enabled build_loop.yml on a
-# schedule) did not fix that. Investigation of this fork's Actions history
-# turned up two distinct problems, not one:
+# schedule) did not fix that. Investigation turned up the real cause, and
+# it turns out upstream LoopKit already found and fixed it -- just not on
+# the branch this fork tracks yet:
 #
-# 1. build_loop.yml's *state* keeps flipping to `disabled_manually`. That
-#    state is only set by an explicit disable (the Actions UI, or an API
-#    call by something holding `actions: write`) -- GitHub's 60-day
-#    inactivity auto-disable sets `disabled_inactivity` instead, a
-#    different value. The actual actor behind this is still unidentified,
-#    so rather than trying to prevent it, this workflow assumes it will
-#    keep happening and just re-enables build_loop.yml before every use.
+# GitHub disables the specific FILENAME build_loop.yml, not just "some
+# scheduled workflow in this repo". Evidence: heartbeat.yml is also a
+# scheduled workflow in the same repo and has never once been disabled
+# across 7+ runs, while build_loop.yml keeps flipping to
+# `disabled_manually` -- including once in the middle of a build it had
+# just been re-enabled to run. Upstream hit the same thing and root-caused
+# it to the filename itself (plausibly flagged given LoopKit/LoopWorkspace
+# has 7.8k+ forks all scheduling that same filename): see
+# LoopKit/LoopWorkspace PR #461, "create new build_loop_auto file to
+# prevent disabling by GitHub" (merged 2026-06-30). Their fix splits the
+# schedule into a new file, build_loop_auto.yml, and turns build_loop.yml
+# into workflow_dispatch-only. That fix is on `dev` but has NOT yet
+# reached `main`, which is what this fork syncs from -- hence still
+# needing a workaround here.
 #
-# 2. Even when build_loop.yml *is* enabled and its own "33 7 * * 0" cron
-#    fires on time, GitHub's scheduled-workflow queue on public repos is
-#    best-effort and has been observed running 4-6 hours late here -- so a
-#    prior "re-enable 5 minutes before" pre-flight trick only worked once,
-#    by coincidence, because both crons happened to drift by a similar
-#    amount. More importantly, build_loop.yml's `build` job only actually
-#    builds on the 2nd Sunday of the month or when upstream has new
-#    commits (see build_loop.yml's `if:` conditions) -- an on-time,
-#    enabled, successful *run* on any other Sunday still skips the build
-#    entirely. That happened here: run fired, "succeeded", built nothing.
+# Also, even when build_loop.yml *is* enabled and its own "33 7 * * 0"
+# cron fires on time, its `build` job only actually builds on the 2nd
+# Sunday of the month or when upstream has new commits (see
+# build_loop.yml's `if:` conditions) -- an on-time, enabled, successful
+# *run* on any other Sunday still skips the build entirely.
 #
 # So instead of waiting on build_loop.yml's own schedule, this workflow
 # re-enables build_loop.yml and then directly `workflow_dispatch`es it
@@ -35,11 +38,28 @@ run-name: Heartbeat (${{ github.ref_name }})
 # needs to stay enabled for the few seconds it takes to accept the
 # dispatch, not survive a whole week un-disabled.
 #
+# RETIREMENT: once a fork sync brings build_loop_auto.yml in from
+# upstream, this workflow detects it and stops dispatching (see the
+# build_loop_auto.yml check in "Decide whether a build is due"), so it
+# won't double-build alongside upstream's own fixed schedule. Once that
+# has been confirmed working via a real scheduled build,
+# .github/workflows/heartbeat.yml and the `heartbeat` branch can be
+# deleted -- that returns this fork to zero divergence from upstream.
+#
 # This file is fork-local: it is not present upstream, so future syncs from
 # LoopKit/LoopWorkspace merge in cleanly around it with no conflicts and no
 # maintenance required. It never touches upstream, and it never commits to
 # main/dev (so it never affects the build-tracking git revision) -- its own
 # heartbeat commits go only to a dedicated `heartbeat` branch in this fork.
+# It DOES, however, merge upstream/main into this fork's main when upstream
+# is ahead (see "Merge upstream into main" below) -- that's not a content
+# change (this fork's only divergence from upstream is this one file, which
+# upstream will never touch) but a mechanical necessity: build_loop.yml's
+# own upstream sync step pulls with `--ff-only` and has no conflict
+# handling, so once upstream's main and this fork's main have diverged
+# histories, that pull -- and the whole build -- would otherwise fail.
+# Keeping this fork's main a superset of upstream's keeps that pull a
+# trivial fast-forward.
 
 on:
   workflow_dispatch:
@@ -66,7 +86,35 @@ jobs:
         uses: actions/checkout@v5
         with:
           token: ${{ secrets.GH_PAT }}
-          fetch-depth: 1
+          fetch-depth: 0
+
+      # Keep this fork's main a superset of upstream's so build_loop.yml's
+      # own sync step (a plain `--ff-only` pull with no conflict handling)
+      # never fails once upstream and this fork have diverged histories.
+      # See the header comment above for why this doesn't create merge
+      # conflicts: this fork's only divergence is this one fork-local file.
+      - name: Merge upstream into main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/LoopKit/LoopWorkspace.git 2>/dev/null || true
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Upstream main is already an ancestor of our main; nothing to merge."
+            echo "**Upstream merge:** already up to date." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Merging upstream/main into main..."
+            if git merge --no-edit upstream/main; then
+              git push origin HEAD:main
+              echo "**Upstream merge:** merged upstream/main and pushed." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::Merging upstream/main into main produced a conflict -- needs manual resolution"
+              echo "**Upstream merge FAILED** -- conflict merging upstream/main, needs manual resolution." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          fi
 
       # Real push activity resets GitHub's 60-day inactivity clock for the
       # whole repository (all workflows), not just this one.
@@ -138,7 +186,22 @@ jobs:
           should_build=false
           reason=""
 
-          if [ "${{ inputs.force_build }}" = "true" ]; then
+          # Retirement guard: once a fork sync brings in upstream's own fix
+          # (PR #461, build_loop_auto.yml carrying the real schedule), stop
+          # dispatching so we don't double-build alongside it. Read straight
+          # from origin/main rather than the current checkout, since an
+          # earlier step in this job may have switched to the heartbeat
+          # branch already.
+          auto_build_exists=false
+          git fetch origin main -q 2>/dev/null || true
+          if git show origin/main:.github/workflows/build_loop_auto.yml > /dev/null 2>&1; then
+            auto_build_exists=true
+          fi
+
+          if [ "$auto_build_exists" = "true" ] && [ "${{ inputs.force_build }}" != "true" ]; then
+            should_build=false
+            reason="build_loop_auto.yml detected on main -- upstream's own scheduled build (PR #461) is now present in this fork. Dispatch disabled to avoid duplicate builds; this heartbeat workflow can now be retired (see header comment)."
+          elif [ "${{ inputs.force_build }}" = "true" ]; then
             should_build=true
             reason="forced via workflow_dispatch input"
           else
