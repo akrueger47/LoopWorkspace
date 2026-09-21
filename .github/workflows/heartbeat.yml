@@ -19,9 +19,8 @@ run-name: Heartbeat (${{ github.ref_name }})
 # LoopKit/LoopWorkspace PR #461, "create new build_loop_auto file to
 # prevent disabling by GitHub" (merged 2026-06-30). Their fix splits the
 # schedule into a new file, build_loop_auto.yml, and turns build_loop.yml
-# into workflow_dispatch-only. That fix is on `dev` but has NOT yet
-# reached `main`, which is what this fork syncs from -- hence still
-# needing a workaround here.
+# into workflow_dispatch-only. That fix reached this fork's main on
+# 2026-09-16.
 #
 # Also, even when build_loop.yml *is* enabled and its own "33 7 * * 0"
 # cron fires on time, its `build` job only actually builds on the 2nd
@@ -38,13 +37,21 @@ run-name: Heartbeat (${{ github.ref_name }})
 # needs to stay enabled for the few seconds it takes to accept the
 # dispatch, not survive a whole week un-disabled.
 #
-# RETIREMENT: once a fork sync brings build_loop_auto.yml in from
-# upstream, this workflow detects it and stops dispatching (see the
-# build_loop_auto.yml check in "Decide whether a build is due"), so it
-# won't double-build alongside upstream's own fixed schedule. Once that
-# has been confirmed working via a real scheduled build,
-# .github/workflows/heartbeat.yml and the `heartbeat` branch can be
-# deleted -- that returns this fork to zero divergence from upstream.
+# RETIREMENT is outcome-based, not existence-based: this workflow only
+# stands down once a real build has actually happened recently, from
+# *either* build_loop.yml or build_loop_auto.yml (see "Decide whether a
+# build is due" below). An earlier version retired the moment
+# build_loop_auto.yml merely existed on main -- but on 2026-09-16 that file
+# arrived, and its first scheduled run on 2026-09-20 completed with zero
+# jobs (a broken workflow registration on GitHub's side: the file itself is
+# byte-identical to upstream and valid, but GitHub never actually parsed it
+# for the `schedule` trigger -- `workflow_dispatch` on the same file worked
+# fine). The existence-based guard stood this heartbeat down in favor of a
+# schedule that silently did nothing, and no build happened until this was
+# caught by hand. Checking for an actual successful build instead means
+# this heartbeat self-corrects: it goes quiet on its own once
+# build_loop_auto.yml starts really working, and keeps covering for it for
+# as long as it doesn't.
 #
 # This file is fork-local: it is not present upstream, so future syncs from
 # LoopKit/LoopWorkspace merge in cleanly around it with no conflicts and no
@@ -94,6 +101,7 @@ jobs:
       # See the header comment above for why this doesn't create merge
       # conflicts: this fork's only divergence is this one fork-local file.
       - name: Merge upstream into main
+        id: upstream_merge
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -103,11 +111,13 @@ jobs:
 
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Upstream main is already an ancestor of our main; nothing to merge."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
             echo "**Upstream merge:** already up to date." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "Merging upstream/main into main..."
             if git merge --no-edit upstream/main; then
               git push origin HEAD:main
+              echo "merged=true" >> "$GITHUB_OUTPUT"
               echo "**Upstream merge:** merged upstream/main and pushed." >> "$GITHUB_STEP_SUMMARY"
             else
               echo "::error::Merging upstream/main into main produced a conflict -- needs manual resolution"
@@ -149,7 +159,7 @@ jobs:
 
           build_loop_active=false
 
-          for wf in build_loop.yml heartbeat.yml; do
+          for wf in build_loop.yml build_loop_auto.yml heartbeat.yml; do
             state=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf" --jq .state 2>/dev/null || echo "unknown")
             action="none"
             after="$state"
@@ -175,62 +185,82 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "build_loop_active=$build_loop_active" >> "$GITHUB_OUTPUT"
 
+      # build_loop_auto.yml can fail with a completed run that created zero
+      # jobs -- a broken GitHub-side workflow registration, not a bug in the
+      # file itself (this is what happened on 2026-09-20: the file was
+      # byte-identical to upstream and valid YAML, but its `schedule`
+      # trigger produced a run with 0 jobs and 0 logs, while
+      # `workflow_dispatch` on the very same file worked fine). That kind of
+      # failure is easy to miss in a "run failed" notification email, so
+      # call it out explicitly here.
+      - name: Check for zero-job build_loop_auto.yml failures
+        run: |
+          latest=$(gh api "repos/${{ github.repository }}/actions/workflows/build_loop_auto.yml/runs?per_page=1&status=completed" --jq '.workflow_runs[0] | select(.conclusion == "failure") | .id' 2>/dev/null || true)
+
+          if [ -n "$latest" ]; then
+            job_count=$(gh api "repos/${{ github.repository }}/actions/runs/$latest/jobs" --jq '.total_count')
+            if [ "$job_count" = "0" ]; then
+              echo "::warning::build_loop_auto.yml run $latest failed with zero jobs (broken workflow registration on GitHub's side) -- this heartbeat is covering for it by dispatching build_loop.yml directly."
+              echo "**build_loop_auto.yml is broken:** its latest completed run ([#$latest](https://github.com/${{ github.repository }}/actions/runs/$latest)) finished with zero jobs. This heartbeat is covering for it." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
       # Ground truth on "was there a real build recently" has to come from
       # the Actions API, not a stored marker: a build_loop.yml *run* can
       # report success while its Build job was skipped (exactly what
-      # happens on every non-2nd-Sunday with no upstream changes). So walk
-      # recent runs looking for one whose "Build" job actually succeeded.
+      # happens on every non-2nd-Sunday with no upstream changes), and a
+      # build_loop_auto.yml *run* can report failure with zero jobs (see
+      # above). So walk recent runs from both build workflows, newest
+      # first, looking for one whose "Build" job actually succeeded.
       - name: Decide whether a build is due
         id: decide
         run: |
           should_build=false
           reason=""
 
-          # Retirement guard: once a fork sync brings in upstream's own fix
-          # (PR #461, build_loop_auto.yml carrying the real schedule), stop
-          # dispatching so we don't double-build alongside it. Read straight
-          # from origin/main rather than the current checkout, since an
-          # earlier step in this job may have switched to the heartbeat
-          # branch already.
-          auto_build_exists=false
-          git fetch origin main -q 2>/dev/null || true
-          if git show origin/main:.github/workflows/build_loop_auto.yml > /dev/null 2>&1; then
-            auto_build_exists=true
-          fi
-
-          if [ "$auto_build_exists" = "true" ] && [ "${{ inputs.force_build }}" != "true" ]; then
-            should_build=false
-            reason="build_loop_auto.yml detected on main -- upstream's own scheduled build (PR #461) is now present in this fork. Dispatch disabled to avoid duplicate builds; this heartbeat workflow can now be retired (see header comment)."
-          elif [ "${{ inputs.force_build }}" = "true" ]; then
+          if [ "${{ inputs.force_build }}" = "true" ]; then
             should_build=true
             reason="forced via workflow_dispatch input"
           else
             last_build_days="unknown"
-            run_ids=$(gh api "repos/${{ github.repository }}/actions/workflows/build_loop.yml/runs?per_page=10&status=completed" --jq '.workflow_runs[].id')
-            now_epoch=$(date -u +%s)
             found=false
 
-            for run_id in $run_ids; do
+            # Combine recent completed runs from both the manual and the
+            # auto-scheduled build workflows, newest first -- whichever one
+            # actually produced a build counts. This is what makes this
+            # heartbeat's retirement outcome-based rather than
+            # existence-based: once build_loop_auto.yml starts completing
+            # real builds, this scan finds them and should_build stays
+            # false on its own, no separate "does the file exist" check
+            # needed.
+            runs_json=$(
+              {
+                gh api "repos/${{ github.repository }}/actions/workflows/build_loop.yml/runs?per_page=10&status=completed" --jq '.workflow_runs[] | [.id, .created_at] | @tsv'
+                gh api "repos/${{ github.repository }}/actions/workflows/build_loop_auto.yml/runs?per_page=10&status=completed" --jq '.workflow_runs[] | [.id, .created_at] | @tsv' 2>/dev/null
+              } | sort -k2 -r
+            )
+
+            now_epoch=$(date -u +%s)
+
+            while IFS=$'\t' read -r run_id run_created; do
+              [ -z "$run_id" ] && continue
               built=$(gh api "repos/${{ github.repository }}/actions/runs/$run_id/jobs" --jq '[.jobs[] | select(.name == "Build" and .conclusion == "success")] | length')
               if [ "$built" -gt 0 ]; then
-                run_created=$(gh api "repos/${{ github.repository }}/actions/runs/$run_id" --jq .created_at)
                 created_epoch=$(date -u -d "$run_created" +%s)
                 last_build_days=$(( (now_epoch - created_epoch) / 86400 ))
                 found=true
                 break
               fi
-            done
-
-            ahead_by=$(gh api "repos/${{ github.repository }}/compare/main...LoopKit:LoopWorkspace:main" --jq .ahead_by 2>/dev/null || echo "unknown")
+            done <<< "$runs_json"
 
             if [ "$found" = "false" ] || { [ "$last_build_days" != "unknown" ] && [ "$last_build_days" -ge 28 ]; }; then
               should_build=true
               reason="no successful build in >=28 days (last: ${last_build_days} days ago)"
-            elif [ "$ahead_by" != "unknown" ] && [ "$ahead_by" -gt 0 ]; then
+            elif [ "${{ steps.upstream_merge.outputs.merged }}" = "true" ]; then
               should_build=true
-              reason="upstream is $ahead_by commit(s) ahead"
+              reason="upstream had new commits that were just merged into main"
             else
-              reason="last build ${last_build_days} days ago, upstream ahead_by=$ahead_by"
+              reason="last build ${last_build_days} days ago, no new upstream commits"
             fi
           fi
 
