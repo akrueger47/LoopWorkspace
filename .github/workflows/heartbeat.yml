@@ -88,6 +88,11 @@ jobs:
       actions: write
     env:
       GH_TOKEN: ${{ secrets.GH_PAT }}
+      # Pin every `gh` subcommand to this fork. The "Merge upstream" step adds
+      # a remote named `upstream` (LoopKit), and with several remotes `gh`
+      # prefers it as the default repo -- on 2026-10-06 that sent
+      # `gh workflow run` to LoopKit/LoopWorkspace (HTTP 403, admin required).
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -278,7 +283,7 @@ jobs:
         run: |
           before=$(gh api "repos/${{ github.repository }}/actions/workflows/build_loop.yml/runs?per_page=1" --jq '.workflow_runs[0].id // 0')
 
-          gh workflow run build_loop.yml --ref main
+          gh workflow run build_loop.yml --ref main --repo "${{ github.repository }}"
 
           dispatched=false
           for i in 1 2 3 4 5 6; do
